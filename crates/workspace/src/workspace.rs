@@ -26,11 +26,12 @@ use futures::{
     Future, FutureExt, StreamExt,
 };
 use gpui::{
-    actions, canvas, impl_actions, point, relative, size, Action, AnyElement, AnyView, AnyWeakView,
-    AppContext, AsyncAppContext, AsyncWindowContext, Bounds, DevicePixels, DragMoveEvent,
-    Entity as _, EntityId, EventEmitter, FocusHandle, FocusableView, Global, KeyContext, Keystroke,
-    LayoutId, ManagedView, Model, ModelContext, PathPromptOptions, Point, PromptLevel, Render,
-    Size, Subscription, Task, View, WeakView, WindowHandle, WindowOptions,
+    actions, canvas, img, impl_actions, point, relative, size, Action, AnyElement, AnyView,
+    AnyWeakView, AppContext, AsyncAppContext, AsyncWindowContext, Bounds, DevicePixels,
+    DragMoveEvent, Entity as _, EntityId, EventEmitter, FocusHandle, FocusableView, Global,
+    ImageSource, KeyContext, Keystroke, LayoutId, ManagedView, Model, ModelContext,
+    PathPromptOptions, Point, PromptLevel, Render, Size, Subscription, Task, View, WeakView,
+    WindowHandle, WindowOptions,
 };
 use item::{
     FollowableItem, FollowableItemHandle, Item, ItemHandle, ItemSettings, PreviewTabsSettings,
@@ -4082,6 +4083,14 @@ impl Render for Workspace {
                     .border_t()
                     .border_b()
                     .border_color(colors.border)
+                    .when_some(colors.background_image_file.as_ref(), |this, image_file| {
+                        this.child(
+                            img(ImageSource::File(image_file.clone()))
+                                .absolute()
+                                .object_fit(gpui::ObjectFit::Cover)
+                                .size_full(),
+                        )
+                    })
                     .child({
                         let this = cx.view().clone();
                         canvas(
