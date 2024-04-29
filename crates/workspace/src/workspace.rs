@@ -29,7 +29,7 @@ use gpui::{
     actions, canvas, img, impl_actions, point, relative, size, Action, AnyElement, AnyView, AnyWeakView,
     AppContext, AsyncAppContext, AsyncWindowContext, Bounds, DevicePixels, DragMoveEvent,
     ElementId, Entity as _, EntityId, EventEmitter, FocusHandle, FocusableView, Global,
-    GlobalElementId, KeyContext, Keystroke, LayoutId, ManagedView, Model, ModelContext,
+    GlobalElementId, ImageSource, KeyContext, Keystroke, LayoutId, ManagedView, Model, ModelContext,
     PathPromptOptions, Point, PromptLevel, Render, Size, Subscription, Task, View, WeakView,
     WindowHandle, WindowOptions,
 };
