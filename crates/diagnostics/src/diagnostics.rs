@@ -87,7 +87,7 @@ struct DiagnosticGroupState {
 impl EventEmitter<EditorEvent> for ProjectDiagnosticsEditor {}
 
 impl Render for ProjectDiagnosticsEditor {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl Element {
+    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let child = if self.path_states.is_empty() {
             div()
                 .bg(cx.theme().colors().editor_background)
@@ -235,7 +235,7 @@ impl ProjectDiagnosticsEditor {
             let diagnostics = cx.new_view(|cx| {
                 ProjectDiagnosticsEditor::new(workspace.project().clone(), workspace_handle, cx)
             });
-            workspace.add_item_to_active_pane(Box::new(diagnostics), cx);
+            workspace.add_item_to_active_pane(Box::new(diagnostics), None, cx);
         }
     }
 

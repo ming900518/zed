@@ -3,37 +3,44 @@ use std::ops::Deref;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
-use calloop::{EventLoop, LoopHandle};
+use calloop::generic::{FdWrapper, Generic};
+use calloop::{channel, EventLoop, LoopHandle, RegistrationToken};
+
 use collections::HashMap;
 use copypasta::x11_clipboard::{Clipboard, Primary, X11ClipboardContext};
 use copypasta::ClipboardProvider;
 
 use util::ResultExt;
 use x11rb::connection::{Connection, RequestConnection};
+use x11rb::cursor;
 use x11rb::errors::ConnectionError;
 use x11rb::protocol::randr::ConnectionExt as _;
+use x11rb::protocol::xinput::{ConnectionExt, ScrollClass};
 use x11rb::protocol::xkb::ConnectionExt as _;
-use x11rb::protocol::xproto::ConnectionExt as _;
-use x11rb::protocol::{randr, xkb, xproto, Event};
+use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _};
+use x11rb::protocol::{randr, render, xinput, xkb, xproto, Event};
+use x11rb::resource_manager::Database;
 use x11rb::xcb_ffi::XCBConnection;
+use xim::{x11rb::X11rbClient, Client};
 use xkbc::x11::ffi::{XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION};
 use xkbcommon::xkb as xkbc;
 
 use crate::platform::linux::LinuxClient;
 use crate::platform::{LinuxCommon, PlatformWindow};
 use crate::{
-    px, AnyWindowHandle, Bounds, CursorStyle, DisplayId, Modifiers, ModifiersChangedEvent, Pixels,
-    PlatformDisplay, PlatformInput, Point, ScrollDelta, Size, TouchPhase, WindowParams, X11Window,
+    modifiers_from_xinput_info, point, px, AnyWindowHandle, Bounds, CursorStyle, DisplayId,
+    Modifiers, ModifiersChangedEvent, Pixels, PlatformDisplay, PlatformInput, Point, ScrollDelta,
+    Size, TouchPhase, WindowParams, X11Window,
 };
 
-use super::{super::SCROLL_LINES, X11Display, X11WindowStatePtr, XcbAtoms};
-use super::{button_of_key, modifiers_from_state};
+use super::{
+    super::{open_uri_internal, SCROLL_LINES},
+    X11Display, X11WindowStatePtr, XcbAtoms,
+};
+use super::{button_from_mask, button_of_key, modifiers_from_state};
+use super::{XimCallbackEvent, XimHandler};
 use crate::platform::linux::is_within_click_distance;
 use crate::platform::linux::platform::DOUBLE_CLICK_INTERVAL;
-use calloop::{
-    generic::{FdWrapper, Generic},
-    RegistrationToken,
-};
 
 pub(crate) struct WindowRef {
     window: X11WindowStatePtr,
@@ -48,6 +55,36 @@ impl Deref for WindowRef {
     }
 }
 
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum EventHandlerError {
+    XCBConnectionError(ConnectionError),
+    XIMClientError(xim::ClientError),
+}
+
+impl std::error::Error for EventHandlerError {}
+
+impl std::fmt::Display for EventHandlerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventHandlerError::XCBConnectionError(err) => err.fmt(f),
+            EventHandlerError::XIMClientError(err) => err.fmt(f),
+        }
+    }
+}
+
+impl From<ConnectionError> for EventHandlerError {
+    fn from(err: ConnectionError) -> Self {
+        EventHandlerError::XCBConnectionError(err)
+    }
+}
+
+impl From<xim::ClientError> for EventHandlerError {
+    fn from(err: xim::ClientError) -> Self {
+        EventHandlerError::XIMClientError(err)
+    }
+}
+
 pub struct X11ClientState {
     pub(crate) loop_handle: LoopHandle<'static, X11Client>,
     pub(crate) event_loop: Option<calloop::EventLoop<'static, X11Client>>,
@@ -56,12 +93,25 @@ pub struct X11ClientState {
     pub(crate) last_location: Point<Pixels>,
     pub(crate) current_count: usize,
 
+    pub(crate) scale_factor: f32,
+
     pub(crate) xcb_connection: Rc<XCBConnection>,
     pub(crate) x_root_index: usize,
+    pub(crate) resource_database: Database,
     pub(crate) atoms: XcbAtoms,
     pub(crate) windows: HashMap<xproto::Window, WindowRef>,
     pub(crate) focused_window: Option<xproto::Window>,
     pub(crate) xkb: xkbc::State,
+    pub(crate) ximc: Option<X11rbClient<Rc<XCBConnection>>>,
+    pub(crate) xim_handler: Option<XimHandler>,
+
+    pub(crate) cursor_handle: cursor::Handle,
+    pub(crate) cursor_styles: HashMap<xproto::Window, CursorStyle>,
+    pub(crate) cursor_cache: HashMap<CursorStyle, xproto::Cursor>,
+
+    pub(crate) scroll_class_data: Vec<xinput::DeviceClassDataScroll>,
+    pub(crate) scroll_x: Option<f32>,
+    pub(crate) scroll_y: Option<f32>,
 
     pub(crate) common: LinuxCommon,
     pub(crate) clipboard: X11ClipboardContext<Clipboard>,
@@ -79,6 +129,8 @@ impl X11ClientStatePtr {
         if let Some(window_ref) = state.windows.remove(&x_window) {
             state.loop_handle.remove(window_ref.refresh_event_token);
         }
+
+        state.cursor_styles.remove(&x_window);
 
         if state.windows.is_empty() {
             state.common.signal.stop();
@@ -110,6 +162,38 @@ impl X11Client {
         xcb_connection
             .prefetch_extension_information(randr::X11_EXTENSION_NAME)
             .unwrap();
+        xcb_connection
+            .prefetch_extension_information(render::X11_EXTENSION_NAME)
+            .unwrap();
+        xcb_connection
+            .prefetch_extension_information(xinput::X11_EXTENSION_NAME)
+            .unwrap();
+
+        let xinput_version = xcb_connection
+            .xinput_xi_query_version(2, 0)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert!(
+            xinput_version.major_version >= 2,
+            "XInput Extension v2 not supported."
+        );
+
+        let master_device_query = xcb_connection
+            .xinput_xi_query_device(1_u16)
+            .unwrap()
+            .reply()
+            .unwrap();
+        let scroll_class_data = master_device_query
+            .infos
+            .iter()
+            .find(|info| info.type_ == xinput::DeviceType::MASTER_POINTER)
+            .unwrap()
+            .classes
+            .iter()
+            .filter_map(|class| class.data.as_scroll())
+            .map(|class| *class)
+            .collect::<Vec<_>>();
 
         let atoms = XcbAtoms::new(&xcb_connection).unwrap();
         let xkb = xcb_connection
@@ -143,17 +227,56 @@ impl X11Client {
             xkbc::x11::state_new_from_device(&xkb_keymap, &xcb_connection, xkb_device_id)
         };
 
+        let screen = xcb_connection.setup().roots.get(x_root_index).unwrap();
+
+        // Values from `Database::GET_RESOURCE_DATABASE`
+        let resource_manager = xcb_connection
+            .get_property(
+                false,
+                screen.root,
+                xproto::AtomEnum::RESOURCE_MANAGER,
+                xproto::AtomEnum::STRING,
+                0,
+                100_000_000,
+            )
+            .unwrap();
+        let resource_manager = resource_manager.reply().unwrap();
+
+        // todo(linux): read hostname
+        let resource_database = Database::new_from_default(&resource_manager, "HOSTNAME".into());
+
+        let scale_factor = resource_database
+            .get_value("Xft.dpi", "Xft.dpi")
+            .ok()
+            .flatten()
+            .map(|dpi: f32| dpi / 96.0)
+            .unwrap_or(1.0);
+
+        let cursor_handle = cursor::Handle::new(&xcb_connection, x_root_index, &resource_database)
+            .unwrap()
+            .reply()
+            .unwrap();
+
         let clipboard = X11ClipboardContext::<Clipboard>::new().unwrap();
         let primary = X11ClipboardContext::<Primary>::new().unwrap();
 
         let xcb_connection = Rc::new(xcb_connection);
+
+        let (xim_tx, xim_rx) = channel::channel::<XimCallbackEvent>();
+
+        let ximc = X11rbClient::init(Rc::clone(&xcb_connection), x_root_index, None).ok();
+        let xim_handler = if ximc.is_some() {
+            Some(XimHandler::new(xim_tx))
+        } else {
+            None
+        };
 
         // Safety: Safe if xcb::Connection always returns a valid fd
         let fd = unsafe { FdWrapper::new(Rc::clone(&xcb_connection)) };
 
         handle
             .insert_source(
-                Generic::new_with_error::<ConnectionError>(
+                Generic::new_with_error::<EventHandlerError>(
                     fd,
                     calloop::Interest::READ,
                     calloop::Mode::Level,
@@ -162,14 +285,63 @@ impl X11Client {
                     let xcb_connection = xcb_connection.clone();
                     move |_readiness, _, client| {
                         while let Some(event) = xcb_connection.poll_for_event()? {
-                            client.handle_event(event);
+                            let mut state = client.0.borrow_mut();
+                            if state.ximc.is_none() || state.xim_handler.is_none() {
+                                drop(state);
+                                client.handle_event(event);
+                                continue;
+                            }
+                            let mut ximc = state.ximc.take().unwrap();
+                            let mut xim_handler = state.xim_handler.take().unwrap();
+                            let xim_connected = xim_handler.connected;
+                            drop(state);
+                            let xim_filtered = match ximc.filter_event(&event, &mut xim_handler) {
+                                Ok(handled) => handled,
+                                Err(err) => {
+                                    log::error!("XIMClientError: {}", err);
+                                    false
+                                }
+                            };
+                            let mut state = client.0.borrow_mut();
+                            state.ximc = Some(ximc);
+                            state.xim_handler = Some(xim_handler);
+                            drop(state);
+                            if xim_filtered {
+                                continue;
+                            }
+                            if xim_connected {
+                                client.xim_handle_event(event);
+                            } else {
+                                client.handle_event(event);
+                            }
                         }
                         Ok(calloop::PostAction::Continue)
                     }
                 },
             )
             .expect("Failed to initialize x11 event source");
-
+        handle
+            .insert_source(xim_rx, {
+                move |chan_event, _, client| match chan_event {
+                    channel::Event::Msg(xim_event) => {
+                        match (xim_event) {
+                            XimCallbackEvent::XimXEvent(event) => {
+                                client.handle_event(event);
+                            }
+                            XimCallbackEvent::XimCommitEvent(window, text) => {
+                                client.xim_handle_commit(window, text);
+                            }
+                            XimCallbackEvent::XimPreeditEvent(window, text) => {
+                                client.xim_handle_preedit(window, text);
+                            }
+                        };
+                    }
+                    channel::Event::Closed => {
+                        log::error!("XIM Event Sender dropped")
+                    }
+                }
+            })
+            .expect("Failed to initialize XIM event source");
         X11Client(Rc::new(RefCell::new(X11ClientState {
             event_loop: Some(event_loop),
             loop_handle: handle,
@@ -177,13 +349,26 @@ impl X11Client {
             last_click: Instant::now(),
             last_location: Point::new(px(0.0), px(0.0)),
             current_count: 0,
+            scale_factor,
 
             xcb_connection,
             x_root_index,
+            resource_database,
             atoms,
             windows: HashMap::default(),
             focused_window: None,
             xkb: xkb_state,
+            ximc,
+            xim_handler,
+
+            cursor_handle,
+            cursor_styles: HashMap::default(),
+            cursor_cache: HashMap::default(),
+
+            scroll_class_data,
+            scroll_x: None,
+            scroll_y: None,
+
             clipboard,
             primary,
         })))
@@ -275,7 +460,6 @@ impl X11Client {
                     }
                     keystroke
                 };
-
                 drop(state);
                 window.handle_input(PlatformInput::KeyDown(crate::KeyDownEvent {
                     keystroke,
@@ -300,14 +484,16 @@ impl X11Client {
                 drop(state);
                 window.handle_input(PlatformInput::KeyUp(crate::KeyUpEvent { keystroke }));
             }
-            Event::ButtonPress(event) => {
+            Event::XinputButtonPress(event) => {
                 let window = self.get_window(event.event)?;
                 let mut state = self.0.borrow_mut();
 
-                let modifiers = modifiers_from_state(event.state);
-                let position =
-                    Point::new((event.event_x as f32).into(), (event.event_y as f32).into());
-                if let Some(button) = button_of_key(event.detail) {
+                let modifiers = modifiers_from_xinput_info(event.mods);
+                let position = point(
+                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                );
+                if let Some(button) = button_of_key(event.detail.try_into().unwrap()) {
                     let click_elapsed = state.last_click.elapsed();
 
                     if click_elapsed < DOUBLE_CLICK_INTERVAL
@@ -330,29 +516,19 @@ impl X11Client {
                         click_count: current_count,
                         first_mouse: false,
                     }));
-                } else if event.detail >= 4 && event.detail <= 5 {
-                    // https://stackoverflow.com/questions/15510472/scrollwheel-event-in-x11
-                    let scroll_direction = if event.detail == 4 { 1.0 } else { -1.0 };
-                    let scroll_y = SCROLL_LINES * scroll_direction;
-
-                    drop(state);
-                    window.handle_input(PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
-                        position,
-                        delta: ScrollDelta::Lines(Point::new(0.0, scroll_y as f32)),
-                        modifiers,
-                        touch_phase: TouchPhase::Moved,
-                    }));
                 } else {
                     log::warn!("Unknown button press: {event:?}");
                 }
             }
-            Event::ButtonRelease(event) => {
+            Event::XinputButtonRelease(event) => {
                 let window = self.get_window(event.event)?;
                 let state = self.0.borrow();
-                let modifiers = modifiers_from_state(event.state);
-                let position =
-                    Point::new((event.event_x as f32).into(), (event.event_y as f32).into());
-                if let Some(button) = button_of_key(event.detail) {
+                let modifiers = modifiers_from_xinput_info(event.mods);
+                let position = point(
+                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                );
+                if let Some(button) = button_of_key(event.detail.try_into().unwrap()) {
                     let click_count = state.current_count;
                     drop(state);
                     window.handle_input(PlatformInput::MouseUp(crate::MouseUpEvent {
@@ -363,24 +539,100 @@ impl X11Client {
                     }));
                 }
             }
-            Event::MotionNotify(event) => {
+            Event::XinputMotion(event) => {
                 let window = self.get_window(event.event)?;
-                let pressed_button = super::button_from_state(event.state);
-                let position =
-                    Point::new((event.event_x as f32).into(), (event.event_y as f32).into());
-                let modifiers = modifiers_from_state(event.state);
-                window.handle_input(PlatformInput::MouseMove(crate::MouseMoveEvent {
-                    pressed_button,
-                    position,
-                    modifiers,
-                }));
+                let state = self.0.borrow();
+                let pressed_button = button_from_mask(event.button_mask[0]);
+                let position = point(
+                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                );
+                drop(state);
+                let modifiers = modifiers_from_xinput_info(event.mods);
+
+                let axisvalues = event
+                    .axisvalues
+                    .iter()
+                    .map(|axisvalue| fp3232_to_f32(*axisvalue))
+                    .collect::<Vec<_>>();
+
+                if event.valuator_mask[0] & 3 != 0 {
+                    window.handle_input(PlatformInput::MouseMove(crate::MouseMoveEvent {
+                        position,
+                        pressed_button,
+                        modifiers,
+                    }));
+                }
+
+                let mut valuator_idx = 0;
+                let scroll_class_data = self.0.borrow().scroll_class_data.clone();
+                for shift in 0..32 {
+                    if (event.valuator_mask[0] >> shift) & 1 == 0 {
+                        continue;
+                    }
+
+                    for scroll_class in &scroll_class_data {
+                        if scroll_class.scroll_type == xinput::ScrollType::HORIZONTAL
+                            && scroll_class.number == shift
+                        {
+                            let new_scroll = axisvalues[valuator_idx]
+                                / fp3232_to_f32(scroll_class.increment)
+                                * SCROLL_LINES as f32;
+                            let old_scroll = self.0.borrow().scroll_x;
+                            self.0.borrow_mut().scroll_x = Some(new_scroll);
+
+                            if let Some(old_scroll) = old_scroll {
+                                let delta_scroll = old_scroll - new_scroll;
+                                window.handle_input(PlatformInput::ScrollWheel(
+                                    crate::ScrollWheelEvent {
+                                        position,
+                                        delta: ScrollDelta::Lines(Point::new(delta_scroll, 0.0)),
+                                        modifiers,
+                                        touch_phase: TouchPhase::default(),
+                                    },
+                                ));
+                            }
+                        } else if scroll_class.scroll_type == xinput::ScrollType::VERTICAL
+                            && scroll_class.number == shift
+                        {
+                            // the `increment` is the valuator delta equivalent to one positive unit of scrolling. Here that means SCROLL_LINES lines.
+                            let new_scroll = axisvalues[valuator_idx]
+                                / fp3232_to_f32(scroll_class.increment)
+                                * SCROLL_LINES as f32;
+                            let old_scroll = self.0.borrow().scroll_y;
+                            self.0.borrow_mut().scroll_y = Some(new_scroll);
+
+                            if let Some(old_scroll) = old_scroll {
+                                let delta_scroll = old_scroll - new_scroll;
+                                window.handle_input(PlatformInput::ScrollWheel(
+                                    crate::ScrollWheelEvent {
+                                        position,
+                                        delta: ScrollDelta::Lines(Point::new(0.0, delta_scroll)),
+                                        modifiers,
+                                        touch_phase: TouchPhase::default(),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+
+                    valuator_idx += 1;
+                }
             }
-            Event::LeaveNotify(event) => {
+            Event::XinputLeave(event) => {
+                self.0.borrow_mut().scroll_x = None; // Set last scroll to `None` so that a large delta isn't created if scrolling is done outside the window (the valuator is global)
+                self.0.borrow_mut().scroll_y = None;
+
                 let window = self.get_window(event.event)?;
-                let pressed_button = super::button_from_state(event.state);
-                let position =
-                    Point::new((event.event_x as f32).into(), (event.event_y as f32).into());
-                let modifiers = modifiers_from_state(event.state);
+                let state = self.0.borrow();
+                let pressed_button = button_from_mask(event.buttons[0]);
+                let position = point(
+                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                );
+                let modifiers = modifiers_from_xinput_info(event.mods);
+                drop(state);
+
                 window.handle_input(PlatformInput::MouseExited(crate::MouseExitEvent {
                     pressed_button,
                     position,
@@ -390,6 +642,79 @@ impl X11Client {
             _ => {}
         };
 
+        Some(())
+    }
+
+    fn xim_handle_event(&self, event: Event) -> Option<()> {
+        match event {
+            Event::KeyPress(event) | Event::KeyRelease(event) => {
+                let mut state = self.0.borrow_mut();
+                let mut ximc = state.ximc.take().unwrap();
+                let mut xim_handler = state.xim_handler.take().unwrap();
+                drop(state);
+                xim_handler.window = event.event;
+                ximc.forward_event(
+                    xim_handler.im_id,
+                    xim_handler.ic_id,
+                    xim::ForwardEventFlag::empty(),
+                    &event,
+                )
+                .unwrap();
+                let mut state = self.0.borrow_mut();
+                state.ximc = Some(ximc);
+                state.xim_handler = Some(xim_handler);
+                drop(state);
+            }
+            event => {
+                self.handle_event(event);
+            }
+        }
+        Some(())
+    }
+
+    fn xim_handle_commit(&self, window: xproto::Window, text: String) -> Option<()> {
+        let window = self.get_window(window).unwrap();
+
+        window.handle_ime_commit(text);
+        Some(())
+    }
+
+    fn xim_handle_preedit(&self, window: xproto::Window, text: String) -> Option<()> {
+        let window = self.get_window(window).unwrap();
+        window.handle_ime_preedit(text);
+
+        let mut state = self.0.borrow_mut();
+        let mut ximc = state.ximc.take().unwrap();
+        let mut xim_handler = state.xim_handler.take().unwrap();
+        drop(state);
+
+        if let Some(area) = window.get_ime_area() {
+            let ic_attributes = ximc
+                .build_ic_attributes()
+                .push(
+                    xim::AttributeName::InputStyle,
+                    xim::InputStyle::PREEDIT_CALLBACKS
+                        | xim::InputStyle::STATUS_NOTHING
+                        | xim::InputStyle::PREEDIT_POSITION,
+                )
+                .push(xim::AttributeName::ClientWindow, xim_handler.window)
+                .push(xim::AttributeName::FocusWindow, xim_handler.window)
+                .nested_list(xim::AttributeName::PreeditAttributes, |b| {
+                    b.push(
+                        xim::AttributeName::SpotLocation,
+                        xim::Point {
+                            x: u32::from(area.origin.x + area.size.width) as i16,
+                            y: u32::from(area.origin.y + area.size.height) as i16,
+                        },
+                    );
+                })
+                .build();
+            ximc.set_ic_values(xim_handler.im_id, xim_handler.ic_id, ic_attributes);
+        }
+        let mut state = self.0.borrow_mut();
+        state.ximc = Some(ximc);
+        state.xim_handler = Some(xim_handler);
+        drop(state);
         Some(())
     }
 }
@@ -447,6 +772,7 @@ impl LinuxClient for X11Client {
             state.x_root_index,
             x_window,
             &state.atoms,
+            state.scale_factor,
         );
 
         let screen_resources = state
@@ -518,8 +844,47 @@ impl LinuxClient for X11Client {
         Box::new(window)
     }
 
-    //todo(linux)
-    fn set_cursor_style(&self, _style: CursorStyle) {}
+    fn set_cursor_style(&self, style: CursorStyle) {
+        let mut state = self.0.borrow_mut();
+        let Some(focused_window) = state.focused_window else {
+            return;
+        };
+        let current_style = state
+            .cursor_styles
+            .get(&focused_window)
+            .unwrap_or(&CursorStyle::Arrow);
+        if *current_style == style {
+            return;
+        }
+
+        let cursor = match state.cursor_cache.get(&style) {
+            Some(cursor) => *cursor,
+            None => {
+                let cursor = state
+                    .cursor_handle
+                    .load_cursor(&state.xcb_connection, &style.to_icon_name())
+                    .expect("failed to load cursor");
+                state.cursor_cache.insert(style, cursor);
+                cursor
+            }
+        };
+
+        state.cursor_styles.insert(focused_window, style);
+        state
+            .xcb_connection
+            .change_window_attributes(
+                focused_window,
+                &ChangeWindowAttributesAux {
+                    cursor: Some(cursor),
+                    ..Default::default()
+                },
+            )
+            .expect("failed to change window cursor");
+    }
+
+    fn open_uri(&self, uri: &str) {
+        open_uri_internal(uri, None);
+    }
 
     fn write_to_primary(&self, item: crate::ClipboardItem) {
         self.0.borrow_mut().primary.set_contents(item.text);
@@ -572,4 +937,8 @@ pub fn mode_refresh_rate(mode: &randr::ModeInfo) -> Duration {
     let micros = 1_000_000_000 / millihertz;
     log::info!("Refreshing at {} micros", micros);
     Duration::from_micros(micros)
+}
+
+fn fp3232_to_f32(value: xinput::Fp3232) -> f32 {
+    value.integral as f32 + value.frac as f32 / u32::MAX as f32
 }
