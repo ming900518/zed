@@ -10,17 +10,18 @@ pub struct Model {
     pub name: String,
     pub user_id: UserId,
     pub hashed_token: String,
+    pub ssh_connection_string: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "super::remote_project::Entity")]
+    #[sea_orm(has_many = "super::dev_server_project::Entity")]
     RemoteProject,
 }
 
-impl Related<super::remote_project::Entity> for Entity {
+impl Related<super::dev_server_project::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::RemoteProject.def()
     }
@@ -32,6 +33,7 @@ impl Model {
             dev_server_id: self.id.to_proto(),
             name: self.name.clone(),
             status: status as i32,
+            ssh_connection_string: self.ssh_connection_string.clone(),
         }
     }
 }

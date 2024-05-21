@@ -68,6 +68,10 @@ impl LinuxClient for HeadlessClient {
         None
     }
 
+    fn can_open_windows(&self) -> anyhow::Result<()> {
+        return Err(anyhow::anyhow!("neither DISPLAY, nor WAYLAND_DISPLAY found. You can still run zed for remote development with --dev-server-token."));
+    }
+
     fn open_window(
         &self,
         _handle: AnyWindowHandle,
@@ -76,8 +80,9 @@ impl LinuxClient for HeadlessClient {
         unimplemented!()
     }
 
-    //todo(linux)
     fn set_cursor_style(&self, _style: CursorStyle) {}
+
+    fn open_uri(&self, _uri: &str) {}
 
     fn write_to_primary(&self, item: crate::ClipboardItem) {}
 

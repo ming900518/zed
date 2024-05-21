@@ -15,8 +15,8 @@ use gpui::{
     actions, div, Action, AnyElement, AnyView, AppContext, Context as _, Element, EntityId,
     EventEmitter, FocusHandle, FocusableView, FontStyle, FontWeight, Global, Hsla,
     InteractiveElement, IntoElement, Model, ModelContext, ParentElement, Point, Render,
-    SharedString, Styled, Subscription, Task, TextStyle, View, ViewContext, VisualContext,
-    WeakModel, WeakView, WhiteSpace, WindowContext,
+    SharedString, Styled, Subscription, Task, TextStyle, UpdateGlobal, View, ViewContext,
+    VisualContext, WeakModel, WeakView, WhiteSpace, WindowContext,
 };
 use menu::Confirm;
 use project::{search::SearchQuery, search_history::SearchHistoryCursor, Project, ProjectPath};
@@ -526,8 +526,8 @@ impl Item for ProjectSearchView {
 impl ProjectSearchView {
     fn toggle_filters(&mut self, cx: &mut ViewContext<Self>) {
         self.filters_enabled = !self.filters_enabled;
-        cx.update_global(|state: &mut ActiveSettings, cx| {
-            state.0.insert(
+        ActiveSettings::update_global(cx, |settings, cx| {
+            settings.0.insert(
                 self.model.read(cx).project.downgrade(),
                 self.current_settings(),
             );
@@ -540,10 +540,11 @@ impl ProjectSearchView {
             filters_enabled: self.filters_enabled,
         }
     }
+
     fn toggle_search_option(&mut self, option: SearchOptions, cx: &mut ViewContext<Self>) {
         self.search_options.toggle(option);
-        cx.update_global(|state: &mut ActiveSettings, cx| {
-            state.0.insert(
+        ActiveSettings::update_global(cx, |settings, cx| {
+            settings.0.insert(
                 self.model.read(cx).project.downgrade(),
                 self.current_settings(),
             );
@@ -738,7 +739,7 @@ impl ProjectSearchView {
 
         let model = cx.new_model(|cx| ProjectSearch::new(workspace.project().clone(), cx));
         let search = cx.new_view(|cx| ProjectSearchView::new(model, cx, None));
-        workspace.add_item_to_active_pane(Box::new(search.clone()), cx);
+        workspace.add_item_to_active_pane(Box::new(search.clone()), None, cx);
         search.update(cx, |search, cx| {
             search
                 .included_files_editor
@@ -789,6 +790,7 @@ impl ProjectSearchView {
                 });
                 workspace.add_item_to_active_pane(
                     Box::new(cx.new_view(|cx| ProjectSearchView::new(model, cx, None))),
+                    None,
                     cx,
                 );
             }
@@ -838,7 +840,7 @@ impl ProjectSearchView {
             let model = cx.new_model(|cx| ProjectSearch::new(workspace.project().clone(), cx));
             let view = cx.new_view(|cx| ProjectSearchView::new(model, cx, settings));
 
-            workspace.add_item_to_active_pane(Box::new(view.clone()), cx);
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, cx);
             view
         };
 
@@ -1628,15 +1630,6 @@ impl ToolbarItemView for ProjectSearchBar {
             ToolbarItemLocation::Hidden
         }
     }
-
-    fn row_count(&self, cx: &WindowContext<'_>) -> usize {
-        if let Some(search) = self.active_project_search.as_ref() {
-            if search.read(cx).filters_enabled {
-                return 2;
-            }
-        }
-        1
-    }
 }
 
 fn register_workspace_action<A: Action>(
@@ -1696,7 +1689,7 @@ fn register_workspace_action_for_present_search<A: Action>(
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use editor::DisplayPoint;
+    use editor::{display_map::DisplayRow, DisplayPoint};
     use gpui::{Action, TestAppContext, WindowHandle};
     use project::FakeFs;
     use serde_json::json;
@@ -1738,15 +1731,15 @@ pub mod tests {
                     .update(cx, |editor, cx| editor.all_text_background_highlights(cx)),
                 &[
                     (
-                        DisplayPoint::new(2, 32)..DisplayPoint::new(2, 35),
+                        DisplayPoint::new(DisplayRow(2), 32)..DisplayPoint::new(DisplayRow(2), 35),
                         match_background_color
                     ),
                     (
-                        DisplayPoint::new(2, 37)..DisplayPoint::new(2, 40),
+                        DisplayPoint::new(DisplayRow(2), 37)..DisplayPoint::new(DisplayRow(2), 40),
                         match_background_color
                     ),
                     (
-                        DisplayPoint::new(5, 6)..DisplayPoint::new(5, 9),
+                        DisplayPoint::new(DisplayRow(5), 6)..DisplayPoint::new(DisplayRow(5), 9),
                         match_background_color
                     )
                 ]
@@ -1756,7 +1749,7 @@ pub mod tests {
                 search_view
                     .results_editor
                     .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                [DisplayPoint::new(2, 32)..DisplayPoint::new(2, 35)]
+                [DisplayPoint::new(DisplayRow(2), 32)..DisplayPoint::new(DisplayRow(2), 35)]
             );
 
             search_view.select_match(Direction::Next, cx);
@@ -1769,7 +1762,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(2, 37)..DisplayPoint::new(2, 40)]
+                    [DisplayPoint::new(DisplayRow(2), 37)..DisplayPoint::new(DisplayRow(2), 40)]
                 );
                 search_view.select_match(Direction::Next, cx);
             })
@@ -1782,7 +1775,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(5, 6)..DisplayPoint::new(5, 9)]
+                    [DisplayPoint::new(DisplayRow(5), 6)..DisplayPoint::new(DisplayRow(5), 9)]
                 );
                 search_view.select_match(Direction::Next, cx);
             })
@@ -1795,7 +1788,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(2, 32)..DisplayPoint::new(2, 35)]
+                    [DisplayPoint::new(DisplayRow(2), 32)..DisplayPoint::new(DisplayRow(2), 35)]
                 );
                 search_view.select_match(Direction::Prev, cx);
             })
@@ -1808,7 +1801,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(5, 6)..DisplayPoint::new(5, 9)]
+                    [DisplayPoint::new(DisplayRow(5), 6)..DisplayPoint::new(DisplayRow(5), 9)]
                 );
                 search_view.select_match(Direction::Prev, cx);
             })
@@ -1821,7 +1814,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(2, 37)..DisplayPoint::new(2, 40)]
+                    [DisplayPoint::new(DisplayRow(2), 37)..DisplayPoint::new(DisplayRow(2), 40)]
                 );
             })
             .unwrap();

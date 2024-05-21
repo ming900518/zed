@@ -1408,6 +1408,11 @@ impl CollabPanel {
             });
         }
 
+        if self.context_menu.is_some() {
+            self.context_menu.take();
+            cx.notify();
+        }
+
         self.update_entries(false, cx);
     }
 
@@ -1564,11 +1569,28 @@ impl CollabPanel {
 
                     *pending_name = Some(channel_name.clone());
 
-                    self.channel_store
-                        .update(cx, |channel_store, cx| {
-                            channel_store.create_channel(&channel_name, *location, cx)
+                    let create = self.channel_store.update(cx, |channel_store, cx| {
+                        channel_store.create_channel(&channel_name, *location, cx)
+                    });
+                    if location.is_none() {
+                        cx.spawn(|this, mut cx| async move {
+                            let channel_id = create.await?;
+                            this.update(&mut cx, |this, cx| {
+                                this.show_channel_modal(
+                                    channel_id,
+                                    channel_modal::Mode::InviteMembers,
+                                    cx,
+                                )
+                            })
                         })
-                        .detach();
+                        .detach_and_prompt_err(
+                            "Failed to create channel",
+                            cx,
+                            |_, _| None,
+                        );
+                    } else {
+                        create.detach_and_prompt_err("Failed to create channel", cx, |_, _| None);
+                    }
                     cx.notify();
                 }
                 ChannelEditingState::Rename {
@@ -1854,12 +1876,8 @@ impl CollabPanel {
         let workspace = self.workspace.clone();
         let user_store = self.user_store.clone();
         let channel_store = self.channel_store.clone();
-        let members = self.channel_store.update(cx, |channel_store, cx| {
-            channel_store.get_channel_member_details(channel_id, cx)
-        });
 
         cx.spawn(|_, mut cx| async move {
-            let members = members.await?;
             workspace.update(&mut cx, |workspace, cx| {
                 workspace.toggle_modal(cx, |cx| {
                     ChannelModal::new(
@@ -1867,7 +1885,6 @@ impl CollabPanel {
                         channel_store.clone(),
                         channel_id,
                         mode,
-                        members,
                         cx,
                     )
                 });
@@ -2149,7 +2166,7 @@ impl CollabPanel {
             .child(list(self.list_state.clone()).size_full())
             .child(
                 v_flex()
-                    .child(div().mx_2().border_primary(cx).border_t())
+                    .child(div().mx_2().border_primary(cx).border_t_1())
                     .child(
                         v_flex()
                             .p_2()
@@ -2944,7 +2961,7 @@ struct DraggedChannelView {
 }
 
 impl Render for DraggedChannelView {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl Element {
+    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let ui_font = ThemeSettings::get_global(cx).ui_font.family.clone();
         h_flex()
             .font_family(ui_font)

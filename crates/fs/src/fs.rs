@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use git::GitHostingProviderRegistry;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -117,12 +118,19 @@ pub struct Metadata {
 
 #[derive(Default)]
 pub struct RealFs {
+    git_hosting_provider_registry: Arc<GitHostingProviderRegistry>,
     git_binary_path: Option<PathBuf>,
 }
 
 impl RealFs {
-    pub fn new(git_binary_path: Option<PathBuf>) -> Self {
-        Self { git_binary_path }
+    pub fn new(
+        git_hosting_provider_registry: Arc<GitHostingProviderRegistry>,
+        git_binary_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            git_hosting_provider_registry,
+            git_binary_path,
+        }
     }
 }
 
@@ -407,7 +415,7 @@ impl Fs for RealFs {
         path: &Path,
         _latency: Duration,
     ) -> Pin<Box<dyn Send + Stream<Item = Vec<PathBuf>>>> {
-        use notify::{event::EventKind, Watcher};
+        use notify::{event::EventKind, event::ModifyKind, Watcher};
         // todo(linux): This spawns two threads, while the macOS impl
         // only spawns one. Can we use a OnceLock or some such to make
         // this better
@@ -435,6 +443,17 @@ impl Fs for RealFs {
                 if let Some(event) = event.ok() {
                     if event.paths.into_iter().any(|path| *path == watched_path) {
                         match event.kind {
+                            EventKind::Modify(ev) => {
+                                if matches!(ev, ModifyKind::Name(_)) {
+                                    file_watcher
+                                        .watch(
+                                            watched_path.as_path(),
+                                            notify::RecursiveMode::Recursive,
+                                        )
+                                        .log_err();
+                                    let _ = tx.try_send(vec![watched_path.clone()]).ok();
+                                }
+                            }
                             EventKind::Create(_) => {
                                 file_watcher
                                     .watch(watched_path.as_path(), notify::RecursiveMode::Recursive)
@@ -474,6 +493,7 @@ impl Fs for RealFs {
                 Arc::new(Mutex::new(RealGitRepository::new(
                     libgit_repository,
                     self.git_binary_path.clone(),
+                    self.git_hosting_provider_registry.clone(),
                 )))
             })
     }

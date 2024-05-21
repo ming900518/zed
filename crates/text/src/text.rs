@@ -520,8 +520,16 @@ impl Buffer {
     pub fn new(replica_id: u16, remote_id: BufferId, mut base_text: String) -> Buffer {
         let line_ending = LineEnding::detect(&base_text);
         LineEnding::normalize(&mut base_text);
+        Self::new_normalized(replica_id, remote_id, line_ending, Rope::from(base_text))
+    }
 
-        let history = History::new(Rope::from(base_text.as_ref()));
+    pub fn new_normalized(
+        replica_id: u16,
+        remote_id: BufferId,
+        line_ending: LineEnding,
+        normalized: Rope,
+    ) -> Buffer {
+        let history = History::new(normalized);
         let mut fragments = SumTree::new();
         let mut insertions = SumTree::new();
 
@@ -2156,6 +2164,24 @@ impl BufferSnapshot {
             range: (start_fragment_id, range.start.offset)..(end_fragment_id, range.end.offset),
             buffer_id: self.remote_id,
         }
+    }
+
+    pub fn has_edits_since(&self, since: &clock::Global) -> bool {
+        if *since != self.version {
+            let mut cursor = self
+                .fragments
+                .filter::<_, usize>(move |summary| !since.observed_all(&summary.max_version));
+            cursor.next(&None);
+            while let Some(fragment) = cursor.item() {
+                let was_visible = fragment.was_visible(since, &self.undo_map);
+                let is_visible = fragment.visible;
+                if was_visible != is_visible {
+                    return true;
+                }
+                cursor.next(&None);
+            }
+        }
+        false
     }
 }
 

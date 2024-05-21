@@ -102,7 +102,7 @@ pub struct EntryDetails {
     is_processing: bool,
     is_cut: bool,
     git_status: Option<GitFileStatus>,
-    is_dotenv: bool,
+    is_private: bool,
 }
 
 #[derive(PartialEq, Clone, Default, Debug, Deserialize)]
@@ -430,6 +430,7 @@ impl ProjectPanel {
             let worktree_id = worktree.id();
             let is_local = project.is_local();
             let is_read_only = project.is_read_only();
+            let is_remote = project.is_remote();
 
             let context_menu = ContextMenu::build(cx, |menu, cx| {
                 menu.context(self.focus_handle.clone()).when_else(
@@ -471,14 +472,17 @@ impl ProjectPanel {
                             .separator()
                             .action("Rename", Box::new(Rename))
                             .when(!is_root, |menu| {
-                                menu.action("Delete", Box::new(Delete { skip_prompt: false }))
+                                menu.action("Trash", Box::new(Trash { skip_prompt: false }))
+                                    .action("Delete", Box::new(Delete { skip_prompt: false }))
                             })
                             .when(is_local & is_root, |menu| {
                                 menu.separator()
-                                    .action(
-                                        "Add Folder to Project…",
-                                        Box::new(workspace::AddFolderToProject),
-                                    )
+                                    .when(!is_remote, |menu| {
+                                        menu.action(
+                                            "Add Folder to Project…",
+                                            Box::new(workspace::AddFolderToProject),
+                                        )
+                                    })
                                     .entry(
                                         "Remove from Project",
                                         None,
@@ -903,10 +907,10 @@ impl ProjectPanel {
             let operation = if trash { "Trash" } else { "Delete" };
             let answer = (!skip_prompt).then(|| {
                 cx.prompt(
-                    PromptLevel::Destructive,
-                    &format!("{operation:?} {file_name:?}?",),
+                    PromptLevel::Info,
+                    &format!("{operation} {file_name:?}?",),
                     None,
-                    &["Delete", "Cancel"],
+                    &[operation, "Cancel"],
                 )
             });
 
@@ -1588,7 +1592,7 @@ impl ProjectPanel {
                             .clipboard_entry
                             .map_or(false, |e| e.is_cut() && e.entry_id() == entry.id),
                         git_status: status,
-                        is_dotenv: entry.is_private,
+                        is_private: entry.is_private,
                     };
 
                     if let Some(edit_state) = &self.edit_state {
@@ -1895,7 +1899,7 @@ impl Render for ProjectPanel {
 }
 
 impl Render for DraggedProjectEntryView {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl Element {
+    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let settings = ProjectPanelSettings::get_global(cx);
         let ui_font = ThemeSettings::get_global(cx).ui_font.family.clone();
         h_flex()
@@ -3393,7 +3397,9 @@ mod tests {
             })
             .unwrap();
 
-        // "Save as"" the buffer, creating a new backing file for it
+        cx.executor().run_until_parked();
+
+        // "Save as" the buffer, creating a new backing file for it
         let save_task = workspace
             .update(cx, |workspace, cx| {
                 workspace.save_active_item(workspace::SaveIntent::Save, cx)

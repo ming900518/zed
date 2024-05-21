@@ -3,8 +3,8 @@ use crate::{
         all_language_settings, AllLanguageSettingsContent, LanguageSettingsContent,
     },
     task_context::ContextProvider,
-    CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
-    LanguageServerName, LspAdapter, LspAdapterDelegate, PARSER, PLAIN_TEXT,
+    with_parser, CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
+    LanguageServerName, LspAdapter, LspAdapterDelegate, PLAIN_TEXT,
 };
 use anyhow::{anyhow, Context as _, Result};
 use collections::{hash_map, HashMap};
@@ -14,6 +14,7 @@ use futures::{
     future::Shared,
     Future, FutureExt as _,
 };
+use globset::GlobSet;
 use gpui::{AppContext, BackgroundExecutor, Task};
 use lsp::LanguageServerId;
 use parking_lot::{Mutex, RwLock};
@@ -124,6 +125,7 @@ pub const QUERY_FILENAME_PREFIXES: &[(
     ("injections", |q| &mut q.injections),
     ("overrides", |q| &mut q.overrides),
     ("redactions", |q| &mut q.redactions),
+    ("runnables", |q| &mut q.runnables),
 ];
 
 /// Tree-sitter language queries for a given language.
@@ -137,6 +139,7 @@ pub struct LanguageQueries {
     pub injections: Option<Cow<'static, str>>,
     pub overrides: Option<Cow<'static, str>>,
     pub redactions: Option<Cow<'static, str>>,
+    pub runnables: Option<Cow<'static, str>>,
 }
 
 #[derive(Clone, Default)]
@@ -504,23 +507,25 @@ impl LanguageRegistry {
         self: &Arc<Self>,
         path: &Path,
         content: Option<&Rope>,
-        user_file_types: Option<&HashMap<Arc<str>, Vec<String>>>,
+        user_file_types: Option<&HashMap<Arc<str>, GlobSet>>,
     ) -> impl Future<Output = Result<Arc<Language>>> {
         let filename = path.file_name().and_then(|name| name.to_str());
         let extension = path.extension_or_hidden_file_name();
         let path_suffixes = [extension, filename];
-        let empty = Vec::new();
+        let empty = GlobSet::empty();
 
         let rx = self.get_or_load_language(move |language_name, config| {
             let path_matches_default_suffix = config
                 .path_suffixes
                 .iter()
                 .any(|suffix| path_suffixes.contains(&Some(suffix.as_str())));
-            let path_matches_custom_suffix = user_file_types
+            let custom_suffixes = user_file_types
                 .and_then(|types| types.get(language_name))
-                .unwrap_or(&empty)
+                .unwrap_or(&empty);
+            let path_matches_custom_suffix = path_suffixes
                 .iter()
-                .any(|suffix| path_suffixes.contains(&Some(suffix.as_str())));
+                .map(|suffix| suffix.unwrap_or(""))
+                .any(|suffix| custom_suffixes.is_match(suffix));
             let content_matches = content.zip(config.first_line_pattern.as_ref()).map_or(
                 false,
                 |(content, pattern)| {
@@ -668,8 +673,7 @@ impl LanguageRegistry {
                                     .file_stem()
                                     .and_then(OsStr::to_str)
                                     .ok_or_else(|| anyhow!("invalid grammar filename"))?;
-                                anyhow::Ok(PARSER.with(|parser| {
-                                    let mut parser = parser.borrow_mut();
+                                anyhow::Ok(with_parser(|parser| {
                                     let mut store = parser.take_wasm_store().unwrap();
                                     let grammar = store.load_language(&grammar_name, &wasm_bytes);
                                     parser.set_wasm_store(store).unwrap();
@@ -712,15 +716,6 @@ impl LanguageRegistry {
             .get(&language.config.name)
             .cloned()
             .unwrap_or_default()
-    }
-
-    pub fn all_prettier_plugins(&self) -> Vec<Arc<str>> {
-        let state = self.state.read();
-        state
-            .languages
-            .iter()
-            .flat_map(|language| language.config.prettier_plugins.iter().cloned())
-            .collect()
     }
 
     pub fn update_lsp_status(

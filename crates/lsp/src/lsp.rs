@@ -262,7 +262,7 @@ impl LanguageServer {
         let mut command = process::Command::new(&binary.path);
         command
             .current_dir(working_dir)
-            .args(binary.arguments)
+            .args(&binary.arguments)
             .envs(binary.env.unwrap_or_default())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -270,7 +270,12 @@ impl LanguageServer {
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
-        let mut server = command.spawn()?;
+        let mut server = command.spawn().with_context(|| {
+            format!(
+                "failed to spawn command. path: {:?}, working directory: {:?}, args: {:?}",
+                binary.path, working_dir, &binary.arguments
+            )
+        })?;
 
         let stdin = server.stdin.take().unwrap();
         let stdout = server.stdout.take().unwrap();
@@ -596,6 +601,7 @@ impl LanguageServer {
                             ResourceOperationKind::Delete,
                         ]),
                         document_changes: Some(true),
+                        snippet_edit_support: Some(true),
                         ..WorkspaceEditClientCapabilities::default()
                     }),
                     ..Default::default()
@@ -707,6 +713,7 @@ impl LanguageServer {
                 }
             }),
             locale: None,
+            ..Default::default()
         };
 
         cx.spawn(|_| async move {
