@@ -28,7 +28,6 @@
       "ctrl-0": "zed::ResetBufferFontSize",
       "ctrl-,": "zed::OpenSettings",
       "ctrl-q": "zed::Quit",
-      "alt-f9": "zed::Hide",
       "f11": "zed::ToggleFullScreen"
     }
   },
@@ -201,7 +200,8 @@
     "context": "AssistantPanel",
     "bindings": {
       "ctrl-g": "search::SelectNextMatch",
-      "ctrl-shift-g": "search::SelectPrevMatch"
+      "ctrl-shift-g": "search::SelectPrevMatch",
+      "alt-m": "assistant::ToggleModelSelector"
     }
   },
   {
@@ -217,6 +217,13 @@
     }
   },
   {
+    "context": "PromptLibrary",
+    "bindings": {
+      "ctrl-n": "prompt_library::NewPrompt",
+      "ctrl-shift-s": "prompt_library::ToggleDefaultPrompt"
+    }
+  },
+  {
     "context": "BufferSearchBar",
     "bindings": {
       "escape": "buffer_search::Dismiss",
@@ -225,7 +232,8 @@
       "shift-enter": "search::SelectPrevMatch",
       "alt-enter": "search::SelectAllMatches",
       "ctrl-f": "search::FocusSearch",
-      "ctrl-h": "search::ToggleReplace"
+      "ctrl-h": "search::ToggleReplace",
+      "ctrl-l": "search::ToggleSelection"
     }
   },
   {
@@ -289,6 +297,7 @@
       "ctrl-alt-g": "search::SelectNextMatch",
       "ctrl-alt-shift-g": "search::SelectPrevMatch",
       "ctrl-alt-shift-h": "search::ToggleReplace",
+      "ctrl-alt-shift-l": "search::ToggleSelection",
       "alt-enter": "search::SelectAllMatches",
       "alt-c": "search::ToggleCaseSensitive",
       "alt-w": "search::ToggleWholeWord",
@@ -635,12 +644,7 @@
       "pagedown": ["terminal::SendKeystroke", "pagedown"],
       "escape": ["terminal::SendKeystroke", "escape"],
       "enter": ["terminal::SendKeystroke", "enter"],
-      "ctrl-c": ["terminal::SendKeystroke", "ctrl-c"],
-
-      // Some nice conveniences
-      "ctrl-backspace": ["terminal::SendText", "\u0015"],
-      "ctrl-right": ["terminal::SendText", "\u0005"],
-      "ctrl-left": ["terminal::SendText", "\u0001"]
+      "ctrl-c": ["terminal::SendKeystroke", "ctrl-c"]
     }
   }
 ]
